@@ -9,7 +9,7 @@ from typing import Iterable
 
 from .model import TelemetryRecord
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,7 +19,7 @@ class StoredTelemetryRecord:
 
 
 class SQLiteTelemetryStore:
-    """Durable local telemetry store with bounded query primitives."""
+    """Durable local telemetry store with bounded query and delivery primitives."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -69,6 +69,14 @@ class SQLiteTelemetryStore:
             )
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_telemetry_service_time ON telemetry_records(service, timestamp DESC)"
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS delivery_cursors (
+                    consumer TEXT PRIMARY KEY,
+                    last_id INTEGER NOT NULL
+                )
+                """
             )
             self._connection.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
@@ -143,6 +151,53 @@ class SQLiteTelemetryStore:
         params.append(limit)
         with self._lock:
             rows = self._connection.execute(sql, params).fetchall()
+        return [self._decode(row) for row in rows]
+
+    @staticmethod
+    def _consumer_name(consumer: str) -> str:
+        name = consumer.strip()
+        if not name or len(name) > 200:
+            raise ValueError("consumer must contain 1 to 200 characters")
+        return name
+
+    def delivery_cursor(self, consumer: str) -> int:
+        name = self._consumer_name(consumer)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT last_id FROM delivery_cursors WHERE consumer = ?", (name,)
+            ).fetchone()
+        return int(row["last_id"]) if row is not None else 0
+
+    def ack_delivery(self, consumer: str, last_id: int) -> None:
+        name = self._consumer_name(consumer)
+        if last_id < 0:
+            raise ValueError("last_id must not be negative")
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO delivery_cursors(consumer, last_id) VALUES (?, ?)
+                ON CONFLICT(consumer) DO UPDATE SET
+                    last_id = MAX(delivery_cursors.last_id, excluded.last_id)
+                """,
+                (name, last_id),
+            )
+
+    def query_after_id(self, after_id: int, *, limit: int = 500) -> list[StoredTelemetryRecord]:
+        if after_id < 0:
+            raise ValueError("after_id must not be negative")
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT id, timestamp, kind, name, service, host, tags_json, payload_json
+                FROM telemetry_records
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (after_id, limit),
+            ).fetchall()
         return [self._decode(row) for row in rows]
 
     def prune_older_than(self, timestamp: float) -> int:
