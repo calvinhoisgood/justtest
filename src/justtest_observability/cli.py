@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from pathlib import Path
 
 from .collectors import HostCollector
+from .dogstatsd import DogStatsDServer
 from .http_server import build_server
 from .resource import ResourceContext
 from .runtime import CollectorRuntime
@@ -35,6 +37,10 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8127)
 
+    dogstatsd = subparsers.add_parser("dogstatsd", help="run the local DogStatsD UDP ingestion endpoint")
+    dogstatsd.add_argument("--host", default="127.0.0.1")
+    dogstatsd.add_argument("--port", type=int, default=8125)
+
     query = subparsers.add_parser("query", help="query locally persisted telemetry")
     query.add_argument("--kind")
     query.add_argument("--service")
@@ -45,17 +51,48 @@ def _parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("status", help="print local store status")
     subparsers.add_parser("collect-once", help="run native local collectors once and exit")
-    agent = subparsers.add_parser("agent", help="continuously run native local collectors")
+    agent = subparsers.add_parser(
+        "agent", help="run native collectors and local-compatible telemetry receivers"
+    )
     agent.add_argument("--interval", type=float, default=15.0)
+    agent.add_argument("--dogstatsd-host", default="127.0.0.1")
+    agent.add_argument("--dogstatsd-port", type=int, default=8125)
+    agent.add_argument(
+        "--no-dogstatsd",
+        dest="dogstatsd",
+        action="store_false",
+        help="disable the DogStatsD UDP receiver",
+    )
+    agent.set_defaults(dogstatsd=True)
     return parser
 
 
-def _runtime(store: SQLiteTelemetryStore, tags: list[tuple[str, str]]) -> CollectorRuntime:
-    return CollectorRuntime(
-        store,
-        [HostCollector()],
-        resource=ResourceContext.local(dict(tags)),
-    )
+def _resource(tags: list[tuple[str, str]]) -> ResourceContext:
+    return ResourceContext.local(dict(tags))
+
+
+def _runtime(store: SQLiteTelemetryStore, resource: ResourceContext) -> CollectorRuntime:
+    return CollectorRuntime(store, [HostCollector()], resource=resource)
+
+
+def _run_dogstatsd(
+    store: SQLiteTelemetryStore,
+    resource: ResourceContext,
+    *,
+    host: str,
+    port: int,
+) -> int:
+    server = DogStatsDServer(store, host=host, port=port, resource=resource)
+    server.start()
+    try:
+        bound_host, bound_port = server.address
+        print(f"DogStatsD listening on udp://{bound_host}:{bound_port}")
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -72,6 +109,13 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 server.server_close()
             return 0
+        if args.command == "dogstatsd":
+            return _run_dogstatsd(
+                store,
+                _resource(args.tag),
+                host=args.host,
+                port=args.port,
+            )
         if args.command == "status":
             print(json.dumps({"database": str(database), "stored": store.count()}))
             return 0
@@ -103,15 +147,28 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0
         if args.command == "collect-once":
-            runtime = _runtime(store, args.tag)
+            runtime = _runtime(store, _resource(args.tag))
             persisted = runtime.collect_once()
             print(json.dumps({"collected": persisted, "stored": store.count()}))
             return 0
         if args.command == "agent":
-            runtime = _runtime(store, args.tag)
+            resource = _resource(args.tag)
+            runtime = _runtime(store, resource)
+            dogstatsd_server: DogStatsDServer | None = None
+            if args.dogstatsd:
+                dogstatsd_server = DogStatsDServer(
+                    store,
+                    host=args.dogstatsd_host,
+                    port=args.dogstatsd_port,
+                    resource=resource,
+                )
+                dogstatsd_server.start()
             try:
                 runtime.run_forever(interval=args.interval)
             except KeyboardInterrupt:
                 pass
+            finally:
+                if dogstatsd_server is not None:
+                    dogstatsd_server.stop()
             return 0
     return 2
