@@ -137,7 +137,11 @@ def _runtime(
 
 
 def _dashboard_url(server: TelemetryHTTPServer) -> str:
-    host, port = server.server_address[:2]
+    try:
+        host, port = server.server_address[:2]
+    except (AttributeError, TypeError, ValueError):
+        # Test doubles and adapter servers may expose only server_port.
+        host, port = "127.0.0.1", server.server_port
     shown_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else str(host)
     return f"http://{shown_host}:{int(port)}/"
 
