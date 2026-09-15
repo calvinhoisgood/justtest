@@ -9,6 +9,7 @@ from .collectors import HostCollector
 from .dogstatsd import DogStatsDServer
 from .forwarder import DurableHTTPForwarder
 from .http_server import build_server
+from .openmetrics import OpenMetricsCollector
 from .resource import ResourceContext
 from .runtime import CollectorRuntime
 from .storage import SQLiteTelemetryStore
@@ -68,7 +69,12 @@ def _parser() -> argparse.ArgumentParser:
     entities.add_argument("--limit", type=int, default=100)
 
     subparsers.add_parser("status", help="print local store status")
-    subparsers.add_parser("collect-once", help="run native local collectors once and exit")
+    collect_once = subparsers.add_parser(
+        "collect-once", help="run configured local and scrape collectors once and exit"
+    )
+    collect_once.add_argument("--openmetrics-url", action="append", default=[])
+    collect_once.add_argument("--openmetrics-timeout", type=float, default=5.0)
+
     agent = subparsers.add_parser(
         "agent", help="run native collectors and local-compatible telemetry receivers"
     )
@@ -80,6 +86,8 @@ def _parser() -> argparse.ArgumentParser:
     agent.add_argument("--forward-batch-size", type=int, default=500)
     agent.add_argument("--forward-timeout", type=float, default=5.0)
     agent.add_argument("--forward-interval", type=float, default=2.0)
+    agent.add_argument("--openmetrics-url", action="append", default=[])
+    agent.add_argument("--openmetrics-timeout", type=float, default=5.0)
     agent.add_argument(
         "--no-dogstatsd",
         dest="dogstatsd",
@@ -94,8 +102,23 @@ def _resource(tags: list[tuple[str, str]]) -> ResourceContext:
     return ResourceContext.local(dict(tags))
 
 
-def _runtime(store: SQLiteTelemetryStore, resource: ResourceContext) -> CollectorRuntime:
-    return CollectorRuntime(store, [HostCollector()], resource=resource)
+def _runtime(
+    store: SQLiteTelemetryStore,
+    resource: ResourceContext,
+    *,
+    openmetrics_urls: list[str] | None = None,
+    openmetrics_timeout: float = 5.0,
+) -> CollectorRuntime:
+    collectors = [HostCollector()]
+    for index, url in enumerate(openmetrics_urls or (), start=1):
+        collectors.append(
+            OpenMetricsCollector(
+                url,
+                name=f"openmetrics-{index}",
+                timeout=openmetrics_timeout,
+            )
+        )
+    return CollectorRuntime(store, collectors, resource=resource)
 
 
 def _run_dogstatsd(
@@ -216,13 +239,23 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0
         if args.command == "collect-once":
-            runtime = _runtime(store, _resource(args.tag))
+            runtime = _runtime(
+                store,
+                _resource(args.tag),
+                openmetrics_urls=args.openmetrics_url,
+                openmetrics_timeout=args.openmetrics_timeout,
+            )
             persisted = runtime.collect_once()
             print(json.dumps({"collected": persisted, "stored": store.count()}))
             return 0
         if args.command == "agent":
             resource = _resource(args.tag)
-            runtime = _runtime(store, resource)
+            runtime = _runtime(
+                store,
+                resource,
+                openmetrics_urls=args.openmetrics_url,
+                openmetrics_timeout=args.openmetrics_timeout,
+            )
             dogstatsd_server: DogStatsDServer | None = None
             forwarder: DurableHTTPForwarder | None = None
             forward_stop = threading.Event()
