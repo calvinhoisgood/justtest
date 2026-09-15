@@ -24,5 +24,7 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: CLI smoke test
         run: python -m justtest_observability --database .tmp/telemetry.db status
+      - name: Native host collector smoke test
+        run: python -m justtest_observability --database .tmp/telemetry.db --tag ci=true collect-once
       - name: Compile sources
         run: python -m compileall -q src tests

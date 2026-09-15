@@ -4,7 +4,7 @@ This repository is being built as a clean-room, dependency-light observability p
 
 ## Current vertical slice
 
-The first milestone provides a shared telemetry envelope for `metric`, `log`, `trace`, `event`, and `service_check` records, durable SQLite storage, a bounded local ingestion/query HTTP API, a CLI, and Windows/Linux CI.
+The first milestone provides a shared telemetry envelope for `metric`, `log`, `trace`, `event`, and `service_check` records, durable SQLite storage, a bounded local ingestion/query HTTP API, a CLI, a failure-isolated collector runtime with shared resource tags, a native host collector, and Windows/Linux CI.
 
 The local API intentionally binds to loopback by default. There is no authentication layer yet, so do not expose it to an untrusted network.
 
@@ -35,6 +35,18 @@ request = Request(
 )
 print(urlopen(request).read().decode())
 PY
+```
+
+Collect host telemetry once without third-party monitoring dependencies:
+
+```bash
+python -m justtest_observability --database ./var/telemetry.db --tag env=dev collect-once
+```
+
+Or continuously collect it every 15 seconds:
+
+```bash
+python -m justtest_observability --database ./var/telemetry.db --tag env=dev agent
 ```
 
 Query locally persisted telemetry:
