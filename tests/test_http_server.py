@@ -76,6 +76,54 @@ class HTTPServerTests(unittest.TestCase):
             entities = json.loads(response.read())
             self.assertEqual(entities["entities"][0]["id"], "ctr-1")
 
+    def test_optional_bearer_auth_protects_v1_routes_but_not_health(self) -> None:
+        protected = build_server("127.0.0.1", 0, self.store, auth_token="unit-test-value")
+        thread = threading.Thread(target=protected.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{protected.server_port}"
+        try:
+            with urlopen(base + "/health", timeout=3) as response:
+                self.assertEqual(response.status, 200)
+
+            with self.assertRaises(HTTPError) as ctx:
+                urlopen(base + "/v1/entities", timeout=3)
+            self.assertEqual(ctx.exception.code, 401)
+            self.assertEqual(ctx.exception.headers["WWW-Authenticate"], "Bearer")
+
+            body = json.dumps(
+                {
+                    "records": [
+                        {"kind": "metric", "name": "secured", "payload": {"value": 1}}
+                    ]
+                }
+            ).encode()
+            unauthorized = Request(
+                base + "/v1/telemetry",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as ctx:
+                urlopen(unauthorized, timeout=3)
+            self.assertEqual(ctx.exception.code, 401)
+
+            authorized = Request(
+                base + "/v1/telemetry",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer unit-test-value",
+                },
+                method="POST",
+            )
+            with urlopen(authorized, timeout=3) as response:
+                self.assertEqual(response.status, 202)
+            self.assertEqual(self.store.query(name="secured")[0].record.payload["value"], 1)
+        finally:
+            protected.shutdown()
+            protected.server_close()
+            thread.join(timeout=2)
+
     def test_rejects_invalid_payload_and_entity_query(self) -> None:
         request = Request(
             self.base + "/v1/telemetry",
