@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .entity import EntitySnapshot
 from .ingest import TelemetryIngestor
 from .storage import SQLiteTelemetryStore, StoredTelemetryRecord
 
@@ -23,6 +24,17 @@ def _stored_to_dict(item: StoredTelemetryRecord) -> dict[str, Any]:
         "host": record.host,
         "tags": dict(record.tags),
         "payload": dict(record.payload),
+    }
+
+
+def _entity_to_dict(item: EntitySnapshot) -> dict[str, Any]:
+    return {
+        "type": item.entity_type,
+        "id": item.entity_id,
+        "first_seen": item.first_seen,
+        "last_seen": item.last_seen,
+        "tags": dict(item.tags),
+        "attributes": dict(item.attributes),
     }
 
 
@@ -52,6 +64,12 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError) as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
+        if target.path == "/v1/entities":
+            try:
+                self._handle_entities(parse_qs(target.query))
+            except (TypeError, ValueError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:
@@ -65,7 +83,9 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             return
         if length <= 0 or length > _MAX_REQUEST_BYTES:
             self._json(
-                HTTPStatus.REQUEST_ENTITY_TOO_LARGE if length > _MAX_REQUEST_BYTES else HTTPStatus.BAD_REQUEST,
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+                if length > _MAX_REQUEST_BYTES
+                else HTTPStatus.BAD_REQUEST,
                 {"error": "request body must contain 1 to 4194304 bytes"},
             )
             return
@@ -87,10 +107,14 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    @staticmethod
+    def _one(params: dict[str, list[str]], name: str) -> str | None:
+        values = params.get(name)
+        return values[-1] if values else None
+
     def _handle_query(self, params: dict[str, list[str]]) -> None:
         def one(name: str) -> str | None:
-            values = params.get(name)
-            return values[-1] if values else None
+            return self._one(params, name)
 
         records = self.server.store.query(
             kind=one("kind"),
@@ -103,6 +127,17 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             before_id=int(one("before_id")) if one("before_id") is not None else None,
         )
         self._json(HTTPStatus.OK, {"records": [_stored_to_dict(item) for item in records]})
+
+    def _handle_entities(self, params: dict[str, list[str]]) -> None:
+        def one(name: str) -> str | None:
+            return self._one(params, name)
+
+        entities = self.server.store.query_entities(
+            entity_type=one("type"),
+            seen_after=float(one("seen_after")) if one("seen_after") is not None else None,
+            limit=int(one("limit") or "100"),
+        )
+        self._json(HTTPStatus.OK, {"entities": [_entity_to_dict(item) for item in entities]})
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
