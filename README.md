@@ -1,24 +1,28 @@
 # justtest observability platform
 
-This repository is being built as a clean-room, dependency-light observability platform. The long-term target is a cohesive product spanning metrics, logs, traces/APM, processes, containers, network telemetry, alerting, service/entity discovery, local durability, reliable forwarding, and explorer/query UX. It does not copy proprietary Datadog source code or claim product equivalence.
+This repository is being built as a clean-room observability platform with a product experience, not only an agent. The long-term target is a cohesive SaaS-style system spanning dashboards/explorers, metrics, logs, traces/APM, processes, containers, network telemetry, alerting, service/entity discovery, local durability, reliable forwarding, and centralized multi-user operation. It does not copy proprietary Datadog source code or claim product equivalence.
 
 ## Current vertical slice
 
-The current milestone is an agent-shaped observability foundation rather than a single profiler. It provides:
+The current milestone now has a first product-facing Web UI as well as the agent/backend foundation. It provides:
 
+- a dark local observability dashboard with Overview, Infrastructure, Services, and Telemetry Explorer views;
+- live summary cards, signal distribution, recent host metric sparklines, entity tables, telemetry search/filtering, and 15-second refresh;
 - a shared telemetry envelope for `metric`, `log`, `trace`, `event`, and `service_check` records;
 - native host telemetry on Linux and Windows without a third-party monitoring agent;
 - loopback DogStatsD UDP ingestion for common metrics, packed values, tags, events, service checks, container origin, and cardinality metadata;
 - bounded Prometheus/OpenMetrics text scraping for common metric, label, type, and timestamp forms;
 - durable SQLite/WAL telemetry storage plus a host/service/container entity catalog;
-- a loopback HTTP ingestion/query API and CLI query surfaces;
+- a local HTTP ingestion/query/overview API and CLI query surfaces;
+- optional bearer authentication for `/v1/*` API routes;
 - durable ordered HTTP forwarding backed by persistent consumer cursors;
 - per-collector failure isolation and shared resource enrichment;
-- Windows/Linux CI on Python 3.11 and 3.13.
+- Windows/Linux CI on Python 3.11 and 3.13;
+- a Windows PyInstaller workflow that builds and smoke-tests a single-file `JustTestObservability.exe` artifact.
 
-The local HTTP API and DogStatsD endpoint intentionally bind to loopback by default. There is no authentication or TLS termination layer yet, so do not expose them directly to an untrusted network.
+The local HTTP API/UI and DogStatsD endpoint intentionally bind to loopback by default. Bearer authentication is available for the `/v1/*` routes, but TLS termination is not implemented. The static dashboard shell and `/health` remain public; when API auth is enabled, the browser prompts for the bearer token and keeps it only in that browser tab. Do not expose the service directly to an untrusted network without HTTPS termination and appropriate access controls.
 
-## Run the local agent
+## Run the local agent and Web UI
 
 ```bash
 python -m pip install -e .
@@ -28,7 +32,34 @@ python -m justtest_observability \
   agent
 ```
 
-The agent collects native host metrics every 15 seconds and listens for DogStatsD on `127.0.0.1:8125` by default. Disable the UDP receiver with `--no-dogstatsd` when the port should not be opened.
+The agent now runs the complete local vertical slice by default: native host collection every 15 seconds, DogStatsD on `127.0.0.1:8125`, and the API/Web UI on `http://127.0.0.1:8127/`.
+
+Open the dashboard in a browser:
+
+```text
+http://127.0.0.1:8127/
+```
+
+Or ask the CLI to open it automatically:
+
+```bash
+python -m justtest_observability --database ./var/telemetry.db agent --open-browser
+```
+
+Disable individual local listeners when required:
+
+```bash
+python -m justtest_observability agent --no-dogstatsd
+python -m justtest_observability agent --no-api
+```
+
+## Windows executable
+
+The `windows-exe` GitHub Actions workflow builds a single-file `JustTestObservability.exe` with PyInstaller and smoke-tests both the CLI and the Web UI on a native Windows runner. The workflow uploads `JustTestObservability-windows-x64` as an Actions artifact.
+
+The packaged Windows entry point is designed for a desktop-like first run: launching the EXE with no arguments starts the local agent and opens the dashboard. Command-line arguments remain available for explicit server/agent configuration.
+
+## DogStatsD ingestion
 
 Send a DogStatsD metric without installing another monitoring agent:
 
@@ -75,10 +106,10 @@ python -m justtest_observability \
 
 ## Local HTTP API and queries
 
-Run the local ingestion/query API:
+A standalone UI/API server remains available when collection should run in another process:
 
 ```bash
-python -m justtest_observability --database ./var/telemetry.db serve
+python -m justtest_observability --database ./var/telemetry.db serve --open-browser
 ```
 
 In another shell, ingest one metric:
@@ -114,7 +145,7 @@ python -m justtest_observability \
   query --kind metric --service demo
 ```
 
-Query the durable entity catalog used as the basis for future Infrastructure, Service, and Container Explorer surfaces:
+Query the durable entity catalog behind the Infrastructure and Services views:
 
 ```bash
 python -m justtest_observability \
@@ -122,7 +153,7 @@ python -m justtest_observability \
   entities --type service
 ```
 
-HTTP endpoints currently available are `GET /health`, `POST /v1/telemetry`, `GET /v1/query`, and `GET /v1/entities`. HTTP ingestion requests are capped at 4 MiB and ingestion batches at 1,000 records.
+HTTP endpoints currently available are `GET /`, `GET /ui`, `GET /health`, `GET /v1/overview`, `POST /v1/telemetry`, `GET /v1/query`, and `GET /v1/entities`. HTTP ingestion requests are capped at 4 MiB and ingestion batches at 1,000 records.
 
 ## Durable forwarding
 
@@ -148,4 +179,4 @@ Forwarding is ordered and at-least-once while source records remain in the local
 
 ## Engineering direction
 
-The design stays deliberately dependency-light and capability-driven: standard-library networking and SQLite first, then deepen workload/process/container collection, logs, traces/APM, common entity/tag semantics, reliable transport, authentication/TLS/configuration, signal-specific indexing, alerting, and richer explorer/query surfaces. New abstractions should earn their complexity through an implemented capability and test coverage.
+The UI is now a first-class product surface. Near-term work will deepen it alongside the backend rather than treating it as an afterthought: richer metric charts and time ranges, process/container inventory, logs, traces/APM, service topology, alerting, saved dashboards, configuration, centralized storage, authentication/authorization, tenant/user concepts, and deployment packaging. The implementation remains capability-driven: abstractions should earn their complexity through a working product capability and test coverage.
