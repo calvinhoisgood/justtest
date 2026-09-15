@@ -58,6 +58,15 @@ def _parser() -> argparse.ArgumentParser:
     query.add_argument("--limit", type=int, default=100)
     query.add_argument("--before-id", type=int)
 
+    entities = subparsers.add_parser(
+        "entities", help="query discovered host, service, and container entities"
+    )
+    entities.add_argument(
+        "--type", dest="entity_type", choices=("host", "service", "container")
+    )
+    entities.add_argument("--seen-after", type=float)
+    entities.add_argument("--limit", type=int, default=100)
+
     subparsers.add_parser("status", help="print local store status")
     subparsers.add_parser("collect-once", help="run native local collectors once and exit")
     agent = subparsers.add_parser(
@@ -180,6 +189,27 @@ def main(argv: list[str] | None = None) -> int:
                             "host": record.host,
                             "tags": dict(record.tags),
                             "payload": dict(record.payload),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+            return 0
+        if args.command == "entities":
+            rows = store.query_entities(
+                entity_type=args.entity_type,
+                seen_after=args.seen_after,
+                limit=args.limit,
+            )
+            for item in rows:
+                print(
+                    json.dumps(
+                        {
+                            "type": item.entity_type,
+                            "id": item.entity_id,
+                            "first_seen": item.first_seen,
+                            "last_seen": item.last_seen,
+                            "tags": dict(item.tags),
+                            "attributes": dict(item.attributes),
                         },
                         separators=(",", ":"),
                     )
