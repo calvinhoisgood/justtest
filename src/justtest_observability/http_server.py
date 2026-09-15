@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 from .entity import EntitySnapshot
 from .ingest import TelemetryIngestor
 from .storage import SQLiteTelemetryStore, StoredTelemetryRecord
+from .web_ui import dashboard_html
 
 _MAX_REQUEST_BYTES = 4 * 1024 * 1024
 
@@ -65,26 +66,28 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         target = urlsplit(self.path)
+        if target.path in {"/", "/ui"}:
+            self._html(HTTPStatus.OK, dashboard_html())
+            return
         if target.path == "/health":
             self._json(HTTPStatus.OK, {"status": "ok", **self.server.ingestor.stats()})
             return
-        if target.path == "/v1/query":
+        if target.path in {"/v1/query", "/v1/entities", "/v1/overview"}:
             if not self._authorized():
                 self._unauthorized()
                 return
-            try:
+        try:
+            if target.path == "/v1/query":
                 self._handle_query(parse_qs(target.query))
-            except (TypeError, ValueError) as exc:
-                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            return
-        if target.path == "/v1/entities":
-            if not self._authorized():
-                self._unauthorized()
                 return
-            try:
+            if target.path == "/v1/entities":
                 self._handle_entities(parse_qs(target.query))
-            except (TypeError, ValueError) as exc:
-                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if target.path == "/v1/overview":
+                self._json(HTTPStatus.OK, self.server.store.overview())
+                return
+        except (TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -174,6 +177,22 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             {"error": "authentication required"},
             extra_headers={"WWW-Authenticate": "Bearer"},
         )
+
+    def _html(self, status: HTTPStatus, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            "img-src 'self' data:; frame-ancestors 'none'",
+        )
+        self.end_headers()
+        self.wfile.write(body)
 
     def _json(
         self,
