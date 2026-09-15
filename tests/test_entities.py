@@ -1,3 +1,5 @@
+import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -67,7 +69,7 @@ class EntityCatalogTests(unittest.TestCase):
                             name="old",
                             timestamp=10.0,
                             service="api",
-                            tags={"env": "prod"},
+                            tags={"env": "prod", "version": "1"},
                             payload={},
                         ),
                     ]
@@ -77,6 +79,60 @@ class EntityCatalogTests(unittest.TestCase):
                 self.assertEqual(service.last_seen, 20.0)
                 self.assertEqual(service.tags["version"], "2")
                 self.assertEqual(service.tags["env"], "prod")
+
+    def test_schema_upgrade_backfills_entities_from_existing_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "telemetry.db"
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2')"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE telemetry_records (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp REAL NOT NULL,
+                        kind TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        service TEXT,
+                        host TEXT,
+                        tags_json TEXT NOT NULL,
+                        payload_json TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO telemetry_records(
+                        timestamp, kind, name, service, host, tags_json, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        42.0,
+                        "metric",
+                        "legacy.metric",
+                        "legacy-api",
+                        "legacy-host",
+                        json.dumps({"env": "legacy"}),
+                        json.dumps({"value": 1, "origin_container_id": "legacy-container"}),
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with SQLiteTelemetryStore(path) as store:
+                entities = {
+                    (item.entity_type, item.entity_id): item for item in store.query_entities()
+                }
+                self.assertIn(("host", "legacy-host"), entities)
+                self.assertIn(("service", "legacy-api"), entities)
+                self.assertIn(("container", "legacy-container"), entities)
+                self.assertEqual(entities[("service", "legacy-api")].tags["env"], "legacy")
 
     def test_entity_filtering_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
