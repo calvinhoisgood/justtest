@@ -38,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve", help="run the local telemetry ingestion/query API")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8127)
+    serve.add_argument("--auth-token", help="optional bearer token required by /v1 routes")
 
     dogstatsd = subparsers.add_parser("dogstatsd", help="run the local DogStatsD UDP ingestion endpoint")
     dogstatsd.add_argument("--host", default="127.0.0.1")
@@ -49,6 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     forward.add_argument("--batch-size", type=int, default=500)
     forward.add_argument("--timeout", type=float, default=5.0)
     forward.add_argument("--interval", type=float, default=2.0)
+    forward.add_argument("--bearer-token", help="optional bearer token for the remote endpoint")
     forward.add_argument("--once", action="store_true")
 
     query = subparsers.add_parser("query", help="query locally persisted telemetry")
@@ -86,6 +88,7 @@ def _parser() -> argparse.ArgumentParser:
     agent.add_argument("--forward-batch-size", type=int, default=500)
     agent.add_argument("--forward-timeout", type=float, default=5.0)
     agent.add_argument("--forward-interval", type=float, default=2.0)
+    agent.add_argument("--forward-bearer-token", help="optional bearer token for forwarding")
     agent.add_argument("--openmetrics-url", action="append", default=[])
     agent.add_argument("--openmetrics-timeout", type=float, default=5.0)
     agent.add_argument(
@@ -146,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     database = Path(args.database)
     with SQLiteTelemetryStore(database) as store:
         if args.command == "serve":
-            server = build_server(args.host, args.port, store)
+            server = build_server(args.host, args.port, store, auth_token=args.auth_token)
             try:
                 print(f"listening on http://{args.host}:{server.server_port}")
                 server.serve_forever()
@@ -169,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
                 consumer=args.consumer,
                 batch_size=args.batch_size,
                 timeout=args.timeout,
+                bearer_token=args.bearer_token,
             )
             if args.once:
                 delivered = forwarder.forward_once()
@@ -267,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                     consumer=args.forward_consumer,
                     batch_size=args.forward_batch_size,
                     timeout=args.forward_timeout,
+                    bearer_token=args.forward_bearer_token,
                 )
             if args.dogstatsd:
                 dogstatsd_server = DogStatsDServer(
