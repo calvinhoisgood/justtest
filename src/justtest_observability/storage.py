@@ -231,6 +231,27 @@ class SQLiteTelemetryStore:
             for row in rows
         ]
 
+    def overview(self) -> dict[str, object]:
+        """Return a compact, bounded summary for overview/dashboard surfaces."""
+        with self._lock:
+            total_row = self._connection.execute(
+                "SELECT COUNT(*) AS count, MAX(timestamp) AS latest FROM telemetry_records"
+            ).fetchone()
+            kind_rows = self._connection.execute(
+                "SELECT kind, COUNT(*) AS count FROM telemetry_records GROUP BY kind"
+            ).fetchall()
+            entity_rows = self._connection.execute(
+                "SELECT entity_type, COUNT(*) AS count FROM entities GROUP BY entity_type"
+            ).fetchall()
+        return {
+            "total_records": int(total_row["count"]),
+            "latest_timestamp": (
+                float(total_row["latest"]) if total_row["latest"] is not None else None
+            ),
+            "records_by_kind": {row["kind"]: int(row["count"]) for row in kind_rows},
+            "entities_by_type": {row["entity_type"]: int(row["count"]) for row in entity_rows},
+        }
+
     def count(self) -> int:
         with self._lock:
             row = self._connection.execute("SELECT COUNT(*) AS count FROM telemetry_records").fetchone()
