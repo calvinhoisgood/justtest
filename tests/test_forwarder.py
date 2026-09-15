@@ -142,6 +142,48 @@ class ForwarderEndToEndTests(unittest.TestCase):
                     server.server_close()
                     thread.join(timeout=2)
 
+    def test_bearer_forwarding_integrates_with_protected_native_api(self) -> None:
+        from justtest_observability.http_server import build_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with SQLiteTelemetryStore(root / "source-auth.db") as source, SQLiteTelemetryStore(
+                root / "dest-auth.db"
+            ) as dest:
+                source.append_many(
+                    [TelemetryRecord(kind="metric", name="secured.metric", payload={"value": 9})]
+                )
+                server = build_server(
+                    "127.0.0.1", 0, dest, auth_token="unit-test-forward-value"
+                )
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    endpoint = f"http://127.0.0.1:{server.server_port}/v1/telemetry"
+                    unauthorized = DurableHTTPForwarder(
+                        source, endpoint, consumer="auth", timeout=1
+                    )
+                    with self.assertRaises(Exception):
+                        unauthorized.forward_once()
+                    self.assertEqual(source.delivery_cursor("auth"), 0)
+                    self.assertEqual(dest.count(), 0)
+
+                    authorized = DurableHTTPForwarder(
+                        source,
+                        endpoint,
+                        consumer="auth",
+                        bearer_token="unit-test-forward-value",
+                        timeout=1,
+                    )
+                    self.assertEqual(authorized.forward_once(), 1)
+                    received = dest.query(name="secured.metric")
+                    self.assertEqual(received[0].record.payload["value"], 9)
+                    self.assertEqual(source.delivery_cursor("auth"), 1)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()
