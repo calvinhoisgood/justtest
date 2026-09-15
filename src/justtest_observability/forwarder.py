@@ -71,6 +71,7 @@ class DurableHTTPForwarder:
         batch_size: int = 500,
         timeout: float = 5.0,
         max_body_bytes: int = 3_500_000,
+        bearer_token: str | None = None,
         opener: Callable[..., object] = urlopen,
     ) -> None:
         if not endpoint.startswith(("http://", "https://")):
@@ -81,6 +82,8 @@ class DurableHTTPForwarder:
             raise ValueError("timeout must be positive")
         if not 1024 <= max_body_bytes <= 4 * 1024 * 1024:
             raise ValueError("max_body_bytes must be between 1024 and 4194304")
+        if bearer_token is not None and not bearer_token:
+            raise ValueError("bearer_token must not be empty")
         self.store = store
         self.endpoint = endpoint
         self.store.delivery_cursor(consumer)
@@ -88,6 +91,7 @@ class DurableHTTPForwarder:
         self.batch_size = batch_size
         self.timeout = timeout
         self.max_body_bytes = max_body_bytes
+        self.bearer_token = bearer_token
         self._opener = opener
         self._lock = threading.Lock()
         self._status = {
@@ -118,10 +122,13 @@ class DurableHTTPForwarder:
         body, selected = _encode_batch(rows, max_body_bytes=self.max_body_bytes)
         if not selected:
             return 0
+        headers = {"Content-Type": "application/json"}
+        if self.bearer_token is not None:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
         request = Request(
             self.endpoint,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with self._lock:
