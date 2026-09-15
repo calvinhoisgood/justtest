@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .entity import EntitySnapshot, derive_entities
 from .model import TelemetryRecord
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +80,25 @@ class SQLiteTelemetryStore:
                 """
             )
             self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS entities (
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    first_seen REAL NOT NULL,
+                    last_seen REAL NOT NULL,
+                    tags_json TEXT NOT NULL,
+                    attributes_json TEXT NOT NULL,
+                    PRIMARY KEY(entity_type, entity_id)
+                )
+                """
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entities_last_seen ON entities(last_seen DESC)"
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entities_type_seen ON entities(entity_type, last_seen DESC)"
+            )
+            self._connection.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
                 (str(_SCHEMA_VERSION),),
             )
@@ -107,7 +127,87 @@ class SQLiteTelemetryStore:
                     ),
                 )
                 ids.append(int(cursor.lastrowid))
+                for entity in derive_entities(record):
+                    self._upsert_entity(entity)
         return ids
+
+    def _upsert_entity(self, entity: EntitySnapshot) -> None:
+        row = self._connection.execute(
+            """
+            SELECT first_seen, last_seen, tags_json, attributes_json
+            FROM entities WHERE entity_type = ? AND entity_id = ?
+            """,
+            (entity.entity_type, entity.entity_id),
+        ).fetchone()
+        tags = dict(entity.tags)
+        attributes = dict(entity.attributes)
+        first_seen = entity.first_seen
+        last_seen = entity.last_seen
+        if row is not None:
+            existing_tags = json.loads(row["tags_json"])
+            existing_tags.update(tags)
+            tags = existing_tags
+            existing_attributes = json.loads(row["attributes_json"])
+            if entity.last_seen >= float(row["last_seen"]):
+                existing_attributes.update(attributes)
+            attributes = existing_attributes
+            first_seen = min(first_seen, float(row["first_seen"]))
+            last_seen = max(last_seen, float(row["last_seen"]))
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO entities(
+                entity_type, entity_id, first_seen, last_seen, tags_json, attributes_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entity.entity_type,
+                entity.entity_id,
+                first_seen,
+                last_seen,
+                json.dumps(tags, sort_keys=True, separators=(",", ":")),
+                json.dumps(attributes, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+
+    def query_entities(
+        self,
+        *,
+        entity_type: str | None = None,
+        seen_after: float | None = None,
+        limit: int = 100,
+    ) -> list[EntitySnapshot]:
+        if not 1 <= limit <= 5000:
+            raise ValueError("limit must be between 1 and 5000")
+        clauses: list[str] = []
+        params: list[object] = []
+        if entity_type is not None:
+            normalized = entity_type.strip().lower()
+            if normalized not in {"host", "service", "container"}:
+                raise ValueError("entity_type must be host, service, or container")
+            clauses.append("entity_type = ?")
+            params.append(normalized)
+        if seen_after is not None:
+            clauses.append("last_seen >= ?")
+            params.append(seen_after)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT entity_type, entity_id, first_seen, last_seen, tags_json, attributes_json "
+                f"FROM entities{where} ORDER BY last_seen DESC, entity_type, entity_id LIMIT ?",
+                params,
+            ).fetchall()
+        return [
+            EntitySnapshot(
+                entity_type=row["entity_type"],
+                entity_id=row["entity_id"],
+                first_seen=float(row["first_seen"]),
+                last_seen=float(row["last_seen"]),
+                tags=json.loads(row["tags_json"]),
+                attributes=json.loads(row["attributes_json"]),
+            )
+            for row in rows
+        ]
 
     def count(self) -> int:
         with self._lock:
