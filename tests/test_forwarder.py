@@ -102,5 +102,46 @@ class DurableForwarderTests(unittest.TestCase):
                 self.assertEqual(_Receiver.attempts, 0)
 
 
+class ForwarderEndToEndTests(unittest.TestCase):
+    def test_forwards_into_native_ingestion_api(self) -> None:
+        from justtest_observability.http_server import build_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with SQLiteTelemetryStore(root / "source.db") as source, SQLiteTelemetryStore(
+                root / "dest.db"
+            ) as dest:
+                source.append_many(
+                    [
+                        TelemetryRecord(
+                            kind="metric",
+                            name="end.to.end",
+                            service="api",
+                            tags={"env": "test"},
+                            payload={"value": 7},
+                        )
+                    ]
+                )
+                server = build_server("127.0.0.1", 0, dest)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    forwarder = DurableHTTPForwarder(
+                        source,
+                        f"http://127.0.0.1:{server.server_port}/v1/telemetry",
+                        consumer="e2e",
+                    )
+                    self.assertEqual(forwarder.forward_once(), 1)
+                    received = dest.query(name="end.to.end")
+                    self.assertEqual(len(received), 1)
+                    self.assertEqual(received[0].record.service, "api")
+                    self.assertEqual(received[0].record.tags["env"], "test")
+                    self.assertEqual(source.delivery_cursor("e2e"), 1)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+
+
 if __name__ == "__main__":
     unittest.main()
