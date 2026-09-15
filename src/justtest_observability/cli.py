@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import threading
+import webbrowser
 from pathlib import Path
 
 from .collectors import HostCollector
 from .dogstatsd import DogStatsDServer
 from .forwarder import DurableHTTPForwarder
-from .http_server import build_server
+from .http_server import TelemetryHTTPServer, build_server
 from .openmetrics import OpenMetricsCollector
 from .resource import ResourceContext
 from .runtime import CollectorRuntime
@@ -35,10 +36,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    serve = subparsers.add_parser("serve", help="run the local telemetry ingestion/query API")
+    serve = subparsers.add_parser("serve", help="run the observability Web UI and local API")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8127)
     serve.add_argument("--auth-token", help="optional bearer token required by /v1 routes")
+    serve.add_argument("--open-browser", action="store_true", help="open the Web UI in a browser")
 
     dogstatsd = subparsers.add_parser("dogstatsd", help="run the local DogStatsD UDP ingestion endpoint")
     dogstatsd.add_argument("--host", default="127.0.0.1")
@@ -78,11 +80,15 @@ def _parser() -> argparse.ArgumentParser:
     collect_once.add_argument("--openmetrics-timeout", type=float, default=5.0)
 
     agent = subparsers.add_parser(
-        "agent", help="run native collectors and local-compatible telemetry receivers"
+        "agent", help="run collectors, receivers, API and the local observability Web UI"
     )
     agent.add_argument("--interval", type=float, default=15.0)
     agent.add_argument("--dogstatsd-host", default="127.0.0.1")
     agent.add_argument("--dogstatsd-port", type=int, default=8125)
+    agent.add_argument("--api-host", default="127.0.0.1")
+    agent.add_argument("--api-port", type=int, default=8127)
+    agent.add_argument("--api-auth-token", help="optional bearer token required by /v1 routes")
+    agent.add_argument("--open-browser", action="store_true", help="open the Web UI in a browser")
     agent.add_argument("--forward-url")
     agent.add_argument("--forward-consumer", default="default-http")
     agent.add_argument("--forward-batch-size", type=int, default=500)
@@ -97,7 +103,13 @@ def _parser() -> argparse.ArgumentParser:
         action="store_false",
         help="disable the DogStatsD UDP receiver",
     )
-    agent.set_defaults(dogstatsd=True)
+    agent.add_argument(
+        "--no-api",
+        dest="api",
+        action="store_false",
+        help="disable the local HTTP API and Web UI",
+    )
+    agent.set_defaults(dogstatsd=True, api=True)
     return parser
 
 
@@ -122,6 +134,21 @@ def _runtime(
             )
         )
     return CollectorRuntime(store, collectors, resource=resource)
+
+
+def _dashboard_url(server: TelemetryHTTPServer) -> str:
+    host, port = server.server_address[:2]
+    shown_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else str(host)
+    return f"http://{shown_host}:{int(port)}/"
+
+
+def _maybe_open_browser(url: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    try:
+        webbrowser.open(url)
+    except Exception as exc:
+        print(f"warning: could not open browser: {exc}")
 
 
 def _run_dogstatsd(
@@ -150,8 +177,10 @@ def main(argv: list[str] | None = None) -> int:
     with SQLiteTelemetryStore(database) as store:
         if args.command == "serve":
             server = build_server(args.host, args.port, store, auth_token=args.auth_token)
+            url = _dashboard_url(server)
             try:
-                print(f"listening on http://{args.host}:{server.server_port}")
+                print(f"Observability UI: {url}")
+                _maybe_open_browser(url, args.open_browser)
                 server.serve_forever()
             except KeyboardInterrupt:
                 pass
@@ -261,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
                 openmetrics_timeout=args.openmetrics_timeout,
             )
             dogstatsd_server: DogStatsDServer | None = None
+            api_server: TelemetryHTTPServer | None = None
+            api_thread: threading.Thread | None = None
             forwarder: DurableHTTPForwarder | None = None
             forward_stop = threading.Event()
             forward_thread: threading.Thread | None = None
@@ -273,23 +304,39 @@ def main(argv: list[str] | None = None) -> int:
                     timeout=args.forward_timeout,
                     bearer_token=args.forward_bearer_token,
                 )
-            if args.dogstatsd:
-                dogstatsd_server = DogStatsDServer(
-                    store,
-                    host=args.dogstatsd_host,
-                    port=args.dogstatsd_port,
-                    resource=resource,
-                )
-                dogstatsd_server.start()
-            if forwarder is not None:
-                forward_thread = threading.Thread(
-                    target=forwarder.run_forever,
-                    kwargs={"interval": args.forward_interval, "stop_event": forward_stop},
-                    name="telemetry-forwarder",
-                    daemon=True,
-                )
-                forward_thread.start()
             try:
+                if args.api:
+                    api_server = build_server(
+                        args.api_host,
+                        args.api_port,
+                        store,
+                        auth_token=args.api_auth_token,
+                    )
+                    api_thread = threading.Thread(
+                        target=api_server.serve_forever,
+                        name="telemetry-http",
+                        daemon=True,
+                    )
+                    api_thread.start()
+                    url = _dashboard_url(api_server)
+                    print(f"Observability UI: {url}")
+                    _maybe_open_browser(url, args.open_browser)
+                if args.dogstatsd:
+                    dogstatsd_server = DogStatsDServer(
+                        store,
+                        host=args.dogstatsd_host,
+                        port=args.dogstatsd_port,
+                        resource=resource,
+                    )
+                    dogstatsd_server.start()
+                if forwarder is not None:
+                    forward_thread = threading.Thread(
+                        target=forwarder.run_forever,
+                        kwargs={"interval": args.forward_interval, "stop_event": forward_stop},
+                        name="telemetry-forwarder",
+                        daemon=True,
+                    )
+                    forward_thread.start()
                 runtime.run_forever(interval=args.interval)
             except KeyboardInterrupt:
                 pass
@@ -299,5 +346,10 @@ def main(argv: list[str] | None = None) -> int:
                     forward_thread.join(timeout=max(args.forward_timeout + 1.0, 2.0))
                 if dogstatsd_server is not None:
                     dogstatsd_server.stop()
+                if api_server is not None:
+                    api_server.shutdown()
+                    api_server.server_close()
+                if api_thread is not None:
+                    api_thread.join(timeout=2.0)
             return 0
     return 2
