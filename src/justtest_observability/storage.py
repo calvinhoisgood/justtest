@@ -48,6 +48,13 @@ class SQLiteTelemetryStore:
             self._connection.execute(
                 "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
+            version_row = self._connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            try:
+                previous_version = int(version_row["value"]) if version_row is not None else 0
+            except (TypeError, ValueError):
+                previous_version = 0
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS telemetry_records (
@@ -98,6 +105,16 @@ class SQLiteTelemetryStore:
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_entities_type_seen ON entities(entity_type, last_seen DESC)"
             )
+            if previous_version < 3:
+                rows = self._connection.execute(
+                    """
+                    SELECT id, timestamp, kind, name, service, host, tags_json, payload_json
+                    FROM telemetry_records ORDER BY id ASC
+                    """
+                ).fetchall()
+                for row in rows:
+                    for entity in derive_entities(self._decode(row).record):
+                        self._upsert_entity(entity)
             self._connection.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
                 (str(_SCHEMA_VERSION),),
@@ -144,15 +161,20 @@ class SQLiteTelemetryStore:
         first_seen = entity.first_seen
         last_seen = entity.last_seen
         if row is not None:
+            existing_last_seen = float(row["last_seen"])
             existing_tags = json.loads(row["tags_json"])
-            existing_tags.update(tags)
+            if entity.last_seen >= existing_last_seen:
+                existing_tags.update(tags)
+            else:
+                for key, value in tags.items():
+                    existing_tags.setdefault(key, value)
             tags = existing_tags
             existing_attributes = json.loads(row["attributes_json"])
-            if entity.last_seen >= float(row["last_seen"]):
+            if entity.last_seen >= existing_last_seen:
                 existing_attributes.update(attributes)
             attributes = existing_attributes
             first_seen = min(first_seen, float(row["first_seen"]))
-            last_seen = max(last_seen, float(row["last_seen"]))
+            last_seen = max(last_seen, existing_last_seen)
         self._connection.execute(
             """
             INSERT OR REPLACE INTO entities(
