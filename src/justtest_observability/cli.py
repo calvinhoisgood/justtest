@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .collectors import HostCollector
 from .dogstatsd import DogStatsDServer
+from .forwarder import DurableHTTPForwarder
 from .http_server import build_server
 from .resource import ResourceContext
 from .runtime import CollectorRuntime
@@ -41,6 +42,14 @@ def _parser() -> argparse.ArgumentParser:
     dogstatsd.add_argument("--host", default="127.0.0.1")
     dogstatsd.add_argument("--port", type=int, default=8125)
 
+    forward = subparsers.add_parser("forward", help="durably forward stored telemetry over HTTP")
+    forward.add_argument("--endpoint", required=True)
+    forward.add_argument("--consumer", default="default-http")
+    forward.add_argument("--batch-size", type=int, default=500)
+    forward.add_argument("--timeout", type=float, default=5.0)
+    forward.add_argument("--interval", type=float, default=2.0)
+    forward.add_argument("--once", action="store_true")
+
     query = subparsers.add_parser("query", help="query locally persisted telemetry")
     query.add_argument("--kind")
     query.add_argument("--service")
@@ -57,6 +66,11 @@ def _parser() -> argparse.ArgumentParser:
     agent.add_argument("--interval", type=float, default=15.0)
     agent.add_argument("--dogstatsd-host", default="127.0.0.1")
     agent.add_argument("--dogstatsd-port", type=int, default=8125)
+    agent.add_argument("--forward-url")
+    agent.add_argument("--forward-consumer", default="default-http")
+    agent.add_argument("--forward-batch-size", type=int, default=500)
+    agent.add_argument("--forward-timeout", type=float, default=5.0)
+    agent.add_argument("--forward-interval", type=float, default=2.0)
     agent.add_argument(
         "--no-dogstatsd",
         dest="dogstatsd",
@@ -116,6 +130,31 @@ def main(argv: list[str] | None = None) -> int:
                 host=args.host,
                 port=args.port,
             )
+        if args.command == "forward":
+            forwarder = DurableHTTPForwarder(
+                store,
+                args.endpoint,
+                consumer=args.consumer,
+                batch_size=args.batch_size,
+                timeout=args.timeout,
+            )
+            if args.once:
+                delivered = forwarder.forward_once()
+                print(
+                    json.dumps(
+                        {
+                            "delivered": delivered,
+                            "consumer": forwarder.consumer,
+                            "last_acked_id": store.delivery_cursor(forwarder.consumer),
+                        }
+                    )
+                )
+                return 0
+            try:
+                forwarder.run_forever(interval=args.interval)
+            except KeyboardInterrupt:
+                pass
+            return 0
         if args.command == "status":
             print(json.dumps({"database": str(database), "stored": store.count()}))
             return 0
@@ -155,6 +194,17 @@ def main(argv: list[str] | None = None) -> int:
             resource = _resource(args.tag)
             runtime = _runtime(store, resource)
             dogstatsd_server: DogStatsDServer | None = None
+            forwarder: DurableHTTPForwarder | None = None
+            forward_stop = threading.Event()
+            forward_thread: threading.Thread | None = None
+            if args.forward_url:
+                forwarder = DurableHTTPForwarder(
+                    store,
+                    args.forward_url,
+                    consumer=args.forward_consumer,
+                    batch_size=args.forward_batch_size,
+                    timeout=args.forward_timeout,
+                )
             if args.dogstatsd:
                 dogstatsd_server = DogStatsDServer(
                     store,
@@ -163,11 +213,22 @@ def main(argv: list[str] | None = None) -> int:
                     resource=resource,
                 )
                 dogstatsd_server.start()
+            if forwarder is not None:
+                forward_thread = threading.Thread(
+                    target=forwarder.run_forever,
+                    kwargs={"interval": args.forward_interval, "stop_event": forward_stop},
+                    name="telemetry-forwarder",
+                    daemon=True,
+                )
+                forward_thread.start()
             try:
                 runtime.run_forever(interval=args.interval)
             except KeyboardInterrupt:
                 pass
             finally:
+                forward_stop.set()
+                if forward_thread is not None:
+                    forward_thread.join(timeout=max(args.forward_timeout + 1.0, 2.0))
                 if dogstatsd_server is not None:
                     dogstatsd_server.stop()
             return 0
