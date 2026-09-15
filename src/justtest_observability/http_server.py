@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,10 +42,19 @@ def _entity_to_dict(item: EntitySnapshot) -> dict[str, Any]:
 class TelemetryHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, server_address: tuple[str, int], store: SQLiteTelemetryStore) -> None:
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        store: SQLiteTelemetryStore,
+        *,
+        auth_token: str | None = None,
+    ) -> None:
+        if auth_token is not None and not auth_token:
+            raise ValueError("auth_token must not be empty")
         super().__init__(server_address, TelemetryRequestHandler)
         self.store = store
         self.ingestor = TelemetryIngestor(store)
+        self.auth_token = auth_token
 
 
 class TelemetryRequestHandler(BaseHTTPRequestHandler):
@@ -59,12 +69,18 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, {"status": "ok", **self.server.ingestor.stats()})
             return
         if target.path == "/v1/query":
+            if not self._authorized():
+                self._unauthorized()
+                return
             try:
                 self._handle_query(parse_qs(target.query))
             except (TypeError, ValueError) as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         if target.path == "/v1/entities":
+            if not self._authorized():
+                self._unauthorized()
+                return
             try:
                 self._handle_entities(parse_qs(target.query))
             except (TypeError, ValueError) as exc:
@@ -75,6 +91,9 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if urlsplit(self.path).path != "/v1/telemetry":
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        if not self._authorized():
+            self._unauthorized()
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -139,15 +158,46 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
         )
         self._json(HTTPStatus.OK, {"entities": [_entity_to_dict(item) for item in entities]})
 
-    def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+    def _authorized(self) -> bool:
+        token = self.server.auth_token
+        if token is None:
+            return True
+        header = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not header.startswith(prefix):
+            return False
+        return hmac.compare_digest(header[len(prefix) :], token)
+
+    def _unauthorized(self) -> None:
+        self._json(
+            HTTPStatus.UNAUTHORIZED,
+            {"error": "authentication required"},
+            extra_headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    def _json(
+        self,
+        status: HTTPStatus,
+        payload: dict[str, Any],
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(encoded)
 
 
-def build_server(host: str, port: int, store: SQLiteTelemetryStore) -> TelemetryHTTPServer:
-    return TelemetryHTTPServer((host, port), store)
+def build_server(
+    host: str,
+    port: int,
+    store: SQLiteTelemetryStore,
+    *,
+    auth_token: str | None = None,
+) -> TelemetryHTTPServer:
+    return TelemetryHTTPServer((host, port), store, auth_token=auth_token)
